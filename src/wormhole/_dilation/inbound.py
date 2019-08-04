@@ -87,7 +87,7 @@ class Inbound(object):
             log.err(DataForMissingSubchannelError(
                 "received DATA for non-existent subchannel {}".format(scid)))
             return
-        sc.remote_data(data)
+        sc.got_remote_data(data)
 
     def handle_close(self, scid):
         log.msg("inbound.handle_close", scid)
@@ -96,7 +96,7 @@ class Inbound(object):
             log.err(CloseForMissingSubchannelError(
                 "received CLOSE for non-existent subchannel {}".format(scid)))
             return
-        sc.remote_close()
+        sc.got_remote_close()
 
     def subchannel_closed(self, scid, sc):
         # connectionLost has just been signalled

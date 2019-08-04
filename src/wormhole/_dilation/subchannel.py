@@ -3,11 +3,13 @@ from collections import deque
 from attr import attrs, attrib
 from attr.validators import instance_of, provides
 from zope.interface import implementer
+from twisted.python import log
 from twisted.internet.defer import inlineCallbacks, returnValue
 from twisted.internet.interfaces import (ITransport, IProducer, IConsumer,
                                          IAddress, IListeningPort,
                                          IStreamClientEndpoint,
-                                         IStreamServerEndpoint)
+                                         IStreamServerEndpoint,
+                                         IHalfCloseableProtocol)
 from twisted.internet.error import ConnectionDone
 from automat import MethodicalMachine
 from .._interfaces import ISubChannel, IDilationManager
@@ -87,35 +89,71 @@ class SubChannel(object):
         # self._pending_outbound = {}
         # self._processed = set()
         self._protocol = None
-        self._pending_dataReceived = []
-        self._pending_connectionLost = (False, None)
+        self._pending_remote_data = []
+        self._pending_remote_close = False
 
     @m.state(initial=True)
     def open(self):
         pass  # pragma: no cover
 
     @m.state()
-    def closing():
+    def read_closed():
+        pass  # pragma: no cover
+
+    @m.state()
+    def write_closed():
         pass  # pragma: no cover
 
     @m.state()
     def closed():
         pass  # pragma: no cover
 
+    def got_remote_data(self, data):
+        if self._protocol:
+            self.remote_data(data)
+        else:
+            self._pending_remote_data.append(data)
+
     @m.input()
     def remote_data(self, data):
         pass
 
+    def got_remote_close(self):
+        if self._protocol:
+            if IHalfCloseableProtocol.providedBy(self._protocol):
+                self.remote_close_half()
+            else:
+                self.remote_close_full()
+        else:
+            self._pending_remote_close = True
+
     @m.input()
-    def remote_close(self):
+    def remote_close_half(self):
+        pass
+
+    @m.input()
+    def remote_close_full(self):
         pass
 
     @m.input()
     def local_data(self, data):
         pass
 
-    @m.input()
     def local_close(self):
+        # there must already be a protocol in place, to call
+        # .transport.loseConnection()
+        assert self._protocol
+        if IHalfCloseableProtocol.providedBy(self._protocol):
+            self.local_close_half()
+        else:
+            self.local_close_full()
+
+    @m.input()
+    def local_close_half(self):
+        pass
+
+    @m.input()
+    def local_close_full(self):
         pass
 
     @m.output()
@@ -128,19 +166,41 @@ class SubChannel(object):
 
     @m.output()
     def signal_dataReceived(self, data):
-        if self._protocol:
-            self._protocol.dataReceived(data)
-        else:
-            self._pending_dataReceived.append(data)
+        self._protocol.dataReceived(data)
+
+    @m.output()
+    def signal_readConnectionLost(self):
+        try:
+            self._protocol.readConnectionLost()
+        except:
+            log.err()
+
+    @m.output()
+    def signal_writeConnectionLost(self):
+        try:
+            self._protocol.writeConnectionLost()
+        except:
+            log.err()
 
     @m.output()
     def signal_connectionLost(self):
-        if self._protocol:
+        try:
             self._protocol.connectionLost(ConnectionDone())
-        else:
-            self._pending_connectionLost = (True, ConnectionDone())
+        except:
+            log.err()
+
+    @m.output()
+    def close_subchannel(self):
         self._manager.subchannel_closed(self._scid, self)
         # we're deleted momentarily
+
+    @m.output()
+    def error_late_remote_data(self, data):
+        raise AlreadyClosedError("inbound DATA after inbound CLOSE")
+
+    @m.output()
+    def error_dup_remote_close(self):
+        raise AlreadyClosedError("inbound CLOSE after inbound CLOSE")
 
     @m.output()
     def error_closed_write(self, data):
@@ -154,15 +214,35 @@ class SubChannel(object):
     # primary transitions
     open.upon(remote_data, enter=open, outputs=[signal_dataReceived])
     open.upon(local_data, enter=open, outputs=[send_data])
-    open.upon(remote_close, enter=closed, outputs=[send_close, signal_connectionLost])
-    open.upon(local_close, enter=closing, outputs=[send_close])
-    closing.upon(remote_data, enter=closing, outputs=[signal_dataReceived])
-    closing.upon(remote_close, enter=closed, outputs=[signal_connectionLost])
+    open.upon(remote_close_half, enter=read_closed, outputs=[signal_readConnectionLost,
+                                                             ])
+    open.upon(remote_close_full, enter=closed, outputs=[send_close,
+                                                        signal_connectionLost,
+                                                        close_subchannel,
+                                                        ])
+    open.upon(local_close_half, enter=write_closed, outputs=[signal_writeConnectionLost,
+                                                             send_close])
+    open.upon(local_close_full, enter=write_closed, outputs=[send_close])
+
+    read_closed.upon(remote_data, enter=read_closed, outputs=[error_late_remote_data])
+    read_closed.upon(local_data, enter=read_closed, outputs=[send_data])
+    read_closed.upon(remote_close_half, enter=read_closed, outputs=[error_dup_remote_close])
+    read_closed.upon(local_close_half, enter=closed, outputs=[send_close,
+                                                              signal_writeConnectionLost,
+                                                              # TODO: does the CLOSE get out first?
+                                                              close_subchannel,
+                                                              ])
+
+    write_closed.upon(remote_data, enter=write_closed, outputs=[signal_dataReceived])
+    write_closed.upon(local_data, enter=write_closed, outputs=[error_closed_write])
+    write_closed.upon(remote_close_half, enter=closed, outputs=[signal_readConnectionLost,
+                                                                close_subchannel])
+    write_closed.upon(remote_close_full, enter=closed, outputs=[signal_connectionLost,
+                                                                close_subchannel])
+    write_closed.upon(local_close_half, enter=write_closed, outputs=[error_closed_close])
 
     # error cases
     # we won't ever see an OPEN, since L4 will log+ignore those for us
-    closing.upon(local_data, enter=closing, outputs=[error_closed_write])
-    closing.upon(local_close, enter=closing, outputs=[error_closed_close])
     # the CLOSED state won't ever see messages, since we'll be deleted
 
     # our endpoints use this
@@ -170,13 +250,12 @@ class SubChannel(object):
     def _set_protocol(self, protocol):
         assert not self._protocol
         self._protocol = protocol
-        if self._pending_dataReceived:
-            for data in self._pending_dataReceived:
-                self._protocol.dataReceived(data)
-            self._pending_dataReceived = []
-        cl, what = self._pending_connectionLost
-        if cl:
-            self._protocol.connectionLost(what)
+        if self._pending_remote_data:
+            for data in self._pending_remote_data:
+                self.got_remote_data(data)
+            del self._pending_remote_data
+        if self._pending_remote_close:
+            self.got_remote_close()
 
     # ITransport
     def write(self, data):
