@@ -87,10 +87,14 @@ class SubChannel(object):
         # self._pending_outbound = {}
         # self._processed = set()
         self._protocol = None
-        self._pending_dataReceived = []
-        self._pending_connectionLost = (False, None)
+        self._pending_remote_data = []
+        self._pending_remote_close = False
 
     @m.state(initial=True)
+    def unconnected(self):
+        pass  # pragma: no cover
+
+    @m.state()
     def open(self):
         pass  # pragma: no cover
 
@@ -101,6 +105,10 @@ class SubChannel(object):
     @m.state()
     def closed():
         pass  # pragma: no cover
+
+    @m.input()
+    def connect_protocol(self):
+        pass
 
     @m.input()
     def remote_data(self, data):
@@ -119,6 +127,14 @@ class SubChannel(object):
         pass
 
     @m.output()
+    def queue_remote_data(self, data):
+        self._pending_remote_data.append(data)
+
+    @m.output()
+    def queue_remote_close(self):
+        self._pending_remote_close = True
+
+    @m.output()
     def send_data(self, data):
         self._manager.send_data(self._scid, data)
 
@@ -128,17 +144,13 @@ class SubChannel(object):
 
     @m.output()
     def signal_dataReceived(self, data):
-        if self._protocol:
-            self._protocol.dataReceived(data)
-        else:
-            self._pending_dataReceived.append(data)
+        assert self._protocol
+        self._protocol.dataReceived(data)
 
     @m.output()
     def signal_connectionLost(self):
-        if self._protocol:
-            self._protocol.connectionLost(ConnectionDone())
-        else:
-            self._pending_connectionLost = (True, ConnectionDone())
+        assert self._protocol
+        self._protocol.connectionLost(ConnectionDone())
         self._manager.subchannel_closed(self._scid, self)
         # we're deleted momentarily
 
@@ -152,6 +164,10 @@ class SubChannel(object):
             "loseConnection not allowed on closed subchannel")
 
     # primary transitions
+    unconnected.upon(connect_protocol, enter=open, outputs=[])
+    unconnected.upon(remote_data, enter=unconnected, outputs=[queue_remote_data])
+    unconnected.upon(remote_close, enter=unconnected, outputs=[queue_remote_close])
+
     open.upon(remote_data, enter=open, outputs=[signal_dataReceived])
     open.upon(local_data, enter=open, outputs=[send_data])
     open.upon(remote_close, enter=closed, outputs=[send_close, signal_connectionLost])
@@ -170,13 +186,13 @@ class SubChannel(object):
     def _set_protocol(self, protocol):
         assert not self._protocol
         self._protocol = protocol
-        if self._pending_dataReceived:
-            for data in self._pending_dataReceived:
-                self._protocol.dataReceived(data)
-            self._pending_dataReceived = []
-        cl, what = self._pending_connectionLost
-        if cl:
-            self._protocol.connectionLost(what)
+        self.connect_protocol() # move from UNCONNECTED to OPEN
+        for data in self._pending_remote_data:
+            self.remote_data(data)
+            del self._pending_remote_data
+        if self._pending_remote_close:
+            self.remote_close()
+            del self._pending_remote_close
 
     # ITransport
     def write(self, data):
